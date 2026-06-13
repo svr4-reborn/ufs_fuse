@@ -1,0 +1,22 @@
+[package]
+name = "svr4-ufs-populate"
+description = "Populate an SVR4 UFS slice from a host directory tree, without FUSE or rsync"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "svr4-ufs-populate"
+path = "src/main.rs"
+
+[dependencies]
+svr4-fs-core = { path = "../../crates/svr4-fs-core" }
+svr4-ufs = { path = "../../crates/svr4-ufs" }
+svr4-disk = { path = "../../crates/svr4-disk" }
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"

@@ -1,0 +1,27 @@
+# Rust port of the SVR4 host tools. See ../host-tools/RUST_PORT_PLAN.md.
+#
+# Phase 0 scaffolding: only svr4-fs-core exists so far. The remaining crates
+# (svr4-disk, svr4-ufs) and binaries land in later phases.
+[workspace]
+resolver = "2"
+members = [
+    "crates/svr4-fs-core",
+    "crates/svr4-disk",
+    "crates/svr4-ufs",
+    "crates/svr4-bfs",
+    "bins/svr4-disk-image",
+    "bins/svr4-ufs-mount",
+    "bins/svr4-ufs-populate",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+rust-version = "1.74"
+
+[profile.release]
+# Static, optimized binaries are the whole point of moving off the Python tools.
+lto = true
+codegen-units = 1
+panic = "abort"

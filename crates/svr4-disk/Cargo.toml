@@ -1,0 +1,15 @@
+[package]
+name = "svr4-disk"
+description = "SVR4 raw disk image layer: MBR, pdinfo, VTOC, alternates, inspection and skeleton creation"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+svr4-fs-core = { path = "../svr4-fs-core" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"

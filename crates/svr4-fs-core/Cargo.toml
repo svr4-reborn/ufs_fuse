@@ -1,0 +1,13 @@
+[package]
+name = "svr4-fs-core"
+description = "Shared on-disk constants, little-endian codec, and image backing for the SVR4 host tools"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+memmap2 = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
