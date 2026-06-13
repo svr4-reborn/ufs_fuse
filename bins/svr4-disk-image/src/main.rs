@@ -9,9 +9,10 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 use svr4_bfs::BfsDetector;
+use svr4_disk::boot::flatten_hdboot_bootstrap;
 use svr4_disk::create::{
     build_geometry, build_slice_layout, create_raw_image_skeleton, RawDiskGeometry,
-    SliceLayoutOptions, DISK_ADDRESSING_CHS, DISK_ADDRESSING_LBA28,
+    SliceLayoutOptions, ACTIVE_PARTITION_CHAINLOADER_MBR, DISK_ADDRESSING_CHS, DISK_ADDRESSING_LBA28,
 };
 use svr4_disk::inspect::{
     get_vtoc_partition_by_selector, inspect_disk_image, resolve_guest_visible_sector, DetectedFs,
@@ -74,6 +75,18 @@ enum Command {
     FormatBfs(FormatBfsArgs),
     /// Format a slice as an empty UFS filesystem.
     FormatUfs(FormatUfsArgs),
+    /// Make an existing image bootable: install the MBR chainloader and flatten
+    /// the `hdboot` ELF into the UNIX partition's bootstrap area.
+    InstallBoot(InstallBootArgs),
+}
+
+#[derive(Args)]
+struct InstallBootArgs {
+    /// Disk image to make bootable (must already have a UNIX partition layout).
+    image: PathBuf,
+    /// Path to the `hdboot` hard-disk bootstrap ELF, e.g. `<sysroot>/stand/hdboot`.
+    #[arg(long)]
+    hdboot: PathBuf,
 }
 
 #[derive(Args)]
@@ -105,6 +118,13 @@ struct FormatBfsArgs {
     /// entry name (max 14 chars, no `/`).
     #[arg(long = "file")]
     files: Vec<String>,
+    /// Add every flat file directly inside this directory as a `/stand` entry,
+    /// using each file's own name. Used to rebuild `/stand` wholesale from
+    /// `<sysroot>/stand` so kernel/boot updates flow through on every populate.
+    /// Dotfiles are skipped; subdirectories and symlinks are rejected. May be
+    /// combined with `--file`.
+    #[arg(long = "from-dir")]
+    from_dir: Option<PathBuf>,
     /// Timestamp (epoch seconds) stamped on the BFS inodes.
     #[arg(long, default_value_t = 0)]
     timestamp: i32,
@@ -265,6 +285,7 @@ fn run() -> Result<(), String> {
         Command::CreateLayout(args) => create_layout(args),
         Command::FormatBfs(args) => format_bfs(args),
         Command::FormatUfs(args) => format_ufs(args),
+        Command::InstallBoot(args) => install_boot(args),
         Command::TraceSector {
             image,
             slice,
@@ -411,8 +432,40 @@ fn format_bfs(args: FormatBfsArgs) -> Result<(), String> {
         return Err(format!("error: slice '{}' has zero length", args.slice));
     }
 
-    // Read each NAME=HOST_PATH file into memory (BFS /stand files are small).
+    // Read each file into memory (BFS /stand files are small). A --from-dir
+    // contributes one entry per flat file inside it (sorted for determinism);
+    // explicit --file specs are appended after.
     let mut owned: Vec<(String, Vec<u8>)> = Vec::new();
+    if let Some(dir) = &args.from_dir {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .map_err(|e| format!("error: cannot read {}: {e}", dir.display()))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("error: reading {}: {e}", dir.display()))?;
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| format!("error: non-UTF-8 name in {}", dir.display()))?;
+            if name.starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path)
+                .map_err(|e| format!("error: stat {}: {e}", path.display()))?;
+            if meta.is_dir() {
+                return Err(format!("error: /stand is flat; {} is a directory", path.display()));
+            }
+            if meta.file_type().is_symlink() {
+                return Err(format!("error: /stand does not support symlinks; {} is one", path.display()));
+            }
+            if !meta.is_file() {
+                return Err(format!("error: unsupported /stand entry {}", path.display()));
+            }
+            let data = std::fs::read(&path).map_err(|e| format!("error: cannot read {}: {e}", path.display()))?;
+            owned.push((name, data));
+        }
+    }
     for spec in &args.files {
         let (name, host_path) = spec
             .split_once('=')
@@ -433,6 +486,48 @@ fn format_bfs(args: FormatBfsArgs) -> Result<(), String> {
         "Formatted BFS slice '{}' ({} file(s)) at byte offset {offset}",
         args.slice,
         files.len()
+    );
+    Ok(())
+}
+
+fn install_boot(args: InstallBootArgs) -> Result<(), String> {
+    // Locate the active UNIX partition (reads only metadata, not the whole image).
+    let report = inspect_disk_image(&args.image, &AnyDetector).map_err(|e| format!("error: {e}"))?;
+    let active = report
+        .active_unix_partition
+        .as_ref()
+        .ok_or("error: image has no active UNIX partition; create the layout first")?;
+    let partition_start = active.start_lba as u64;
+
+    // Flatten the hdboot ELF before touching the image, so a bad ELF aborts
+    // without leaving a half-installed bootloader.
+    let payload = std::fs::read(&args.hdboot)
+        .map_err(|e| format!("error: cannot read {}: {e}", args.hdboot.display()))?;
+    let bootstrap = flatten_hdboot_bootstrap(&payload)?;
+
+    let mut image = MappedImage::open(&args.image)
+        .map_err(|e| format!("error: cannot open {}: {e}", args.image.display()))?;
+    let buf = image.as_mut_slice();
+
+    // 1. MBR chainloader into sector 0, preserving the partition table and the
+    //    0x55AA signature already written by create-layout (bytes 446..512).
+    let code = ACTIVE_PARTITION_CHAINLOADER_MBR;
+    buf[..code.len()].copy_from_slice(code);
+
+    // 2. Flattened hdboot into the partition bootstrap area (the HDPDLOC sectors
+    //    before the pdinfo). flatten_hdboot_bootstrap sized it to fit exactly.
+    let offset = partition_start as usize * SECTOR_SIZE;
+    let end = offset + bootstrap.len();
+    if end > buf.len() {
+        return Err("error: image is too small to hold the partition bootstrap".into());
+    }
+    buf[offset..end].copy_from_slice(&bootstrap);
+
+    image.flush_range(0, SECTOR_SIZE).map_err(|e| format!("error: msync failed: {e}"))?;
+    image.flush_range(offset, bootstrap.len()).map_err(|e| format!("error: msync failed: {e}"))?;
+    println!(
+        "Installed bootloader: MBR chainloader + {}-byte hdboot bootstrap at sector {partition_start}",
+        bootstrap.len()
     );
     Ok(())
 }

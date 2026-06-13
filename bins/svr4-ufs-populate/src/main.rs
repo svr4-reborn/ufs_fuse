@@ -22,13 +22,13 @@ use clap::Parser;
 
 use svr4_disk::inspect::{get_vtoc_partition_by_selector, inspect_disk_image};
 use svr4_disk::structures::SECTOR_SIZE;
-use svr4_fs_core::consts::{UFS_IFBLK, UFS_IFCHR, UFS_ROOT_INODE};
+use svr4_fs_core::consts::{UFS_IFBLK, UFS_IFCHR, UFS_IFDIR, UFS_ROOT_INODE};
 use svr4_fs_core::MappedImage;
 use svr4_ufs::alloc::recompute_summary_counts;
 use svr4_ufs::{
     create_empty_in_parent, detect_ufs_at_start, link_in_parent, lookup_directory_entry,
-    mkdir_in_parent, mknod_in_parent, read_inode, set_inode_contents, symlink_in_parent,
-    UfsDetector, Ufs,
+    mkdir_in_parent, mknod_in_parent, read_inode, resolve_path, set_inode_contents, set_inode_mode,
+    symlink_in_parent, UfsDetector, Ufs,
 };
 
 #[derive(Parser)]
@@ -44,8 +44,12 @@ struct Cli {
     /// Slice to populate, by VTOC index or tag name (e.g. `1` or `root`).
     #[arg(long)]
     slice: Option<String>,
-    /// Device-node table: lines of `path type major minor [octal-mode]`, where
-    /// `type` is `c` (char) or `b` (block). `#` comments and blank lines ignored.
+    /// Node table applied after the tree is copied. Each line is `path type ...`:
+    ///   `path c|b major minor [octal-mode]`  — char/block device node
+    ///   `path d octal-mode`                  — directory (created or chmod'd)
+    ///   `path l target`                      — hard link to an existing path
+    /// `#` comments and blank lines are ignored. Missing parent directories are
+    /// created as 0755.
     #[arg(long)]
     device_table: Option<PathBuf>,
     /// Preserve host uid/gid instead of forcing root (0:0).
@@ -248,6 +252,33 @@ fn ensure_parent_dirs(image: &mut [u8], ufs: &Ufs, path: &str, ts: u32) -> Resul
     Ok((cur, components[components.len() - 1].to_string()))
 }
 
+/// Create directory `path` with `mode`, or `chmod` it if it already exists
+/// (e.g. a dir the sysroot tree already created). Mirrors make_image.py's
+/// `_ensure_ufs_directory`.
+fn ensure_dir_with_mode(
+    image: &mut [u8],
+    ufs: &Ufs,
+    path: &str,
+    mode: u32,
+    ts: u32,
+) -> Result<(), String> {
+    let (parent, name) = ensure_parent_dirs(image, ufs, path, ts)?;
+    let parent_inode = read_inode(image, ufs, parent)
+        .ok_or_else(|| format!("error: inode {parent} unreadable while creating {path:?}"))?;
+    match lookup_directory_entry(image, ufs, &parent_inode, &name) {
+        Some((number, inode)) => {
+            if !inode.is_directory() {
+                return Err(format!("error: {path:?} exists but is not a directory"));
+            }
+            set_inode_mode(image, ufs, number as i64, UFS_IFDIR | mode);
+        }
+        None => {
+            mkdir_in_parent(image, ufs, parent, &name, mode, 0, 0, ts)?;
+        }
+    }
+    Ok(())
+}
+
 fn apply_device_table(
     image: &mut [u8],
     ufs: &Ufs,
@@ -262,37 +293,54 @@ fn apply_device_table(
             continue;
         }
         let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 4 {
-            return Err(format!(
-                "error: {}:{}: expected `path type major minor [mode]`",
-                table.display(),
-                lineno + 1
-            ));
-        }
-        let dev_path = fields[0];
-        let kind = match fields[1] {
-            "c" => UFS_IFCHR,
-            "b" => UFS_IFBLK,
-            other => {
-                return Err(format!(
-                    "error: {}:{}: device type must be `c` or `b`, got {other:?}",
-                    table.display(),
-                    lineno + 1
-                ))
+        let bad = |msg: &str| format!("error: {}:{}: {msg}", table.display(), lineno + 1);
+        let path = fields.first().copied().ok_or_else(|| bad("empty entry"))?;
+        let kind = fields.get(1).copied().ok_or_else(|| {
+            bad("expected `path type ...`")
+        })?;
+        let ts = options.timestamp;
+
+        match kind {
+            "c" | "b" => {
+                if fields.len() < 4 {
+                    return Err(bad("expected `path c|b major minor [mode]`"));
+                }
+                let file_type = if kind == "c" { UFS_IFCHR } else { UFS_IFBLK };
+                let major = parse_num(fields[2], table, lineno)?;
+                let minor = parse_num(fields[3], table, lineno)?;
+                let mode = match fields.get(4) {
+                    Some(m) => parse_mode(m, table, lineno)?,
+                    None => 0o600,
+                };
+                let (parent, name) = ensure_parent_dirs(image, ufs, path, ts)?;
+                mknod_in_parent(image, ufs, parent, &name, file_type, major, minor, mode, 0, 0, ts)?;
             }
-        };
-        let major = parse_num(fields[2], table, lineno)?;
-        let minor = parse_num(fields[3], table, lineno)?;
-        let mode = if let Some(m) = fields.get(4) {
-            u32::from_str_radix(m.trim_start_matches("0o"), 8)
-                .map_err(|_| format!("error: {}:{}: bad mode {m:?}", table.display(), lineno + 1))?
-        } else {
-            0o600
-        };
-        let (parent, name) = ensure_parent_dirs(image, ufs, dev_path, options.timestamp)?;
-        mknod_in_parent(image, ufs, parent, &name, kind, major, minor, mode, 0, 0, options.timestamp)?;
+            "d" => {
+                if fields.len() < 3 {
+                    return Err(bad("expected `path d octal-mode`"));
+                }
+                let mode = parse_mode(fields[2], table, lineno)?;
+                ensure_dir_with_mode(image, ufs, path, mode, ts)?;
+            }
+            "l" => {
+                if fields.len() < 3 {
+                    return Err(bad("expected `path l target`"));
+                }
+                let target = fields[2];
+                let (target_number, _) = resolve_path(image, ufs, target)
+                    .ok_or_else(|| bad(&format!("link target {target:?} does not exist")))?;
+                let (parent, name) = ensure_parent_dirs(image, ufs, path, ts)?;
+                link_in_parent(image, ufs, parent, &name, target_number as i64)?;
+            }
+            other => return Err(bad(&format!("type must be `c`, `b`, `d`, or `l`, got {other:?}"))),
+        }
     }
     Ok(())
+}
+
+fn parse_mode(value: &str, table: &Path, lineno: usize) -> Result<u32, String> {
+    u32::from_str_radix(value.trim_start_matches("0o"), 8)
+        .map_err(|_| format!("error: {}:{}: bad octal mode {value:?}", table.display(), lineno + 1))
 }
 
 fn parse_num(value: &str, table: &Path, lineno: usize) -> Result<u32, String> {

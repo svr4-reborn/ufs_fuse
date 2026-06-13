@@ -4,6 +4,7 @@
 //! parsing and construction, plus image inspection with a pluggable filesystem
 //! detector ([`inspect::FsDetector`]). The UFS detector arrives in Phase 2.
 
+pub mod boot;
 pub mod create;
 pub mod inspect;
 pub mod mbr;
