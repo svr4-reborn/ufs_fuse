@@ -31,10 +31,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use fuser::{
-    BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, LockOwner, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, SessionACL,
-    TimeOrNow, WriteFlags,
+    AccessFlags, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem,
+    FopenFlags, Generation, INodeNo, LockOwner, MountOption, OpenFlags, RenameFlags, ReplyAttr,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs,
+    ReplyWrite, ReplyXattr, Request, SessionACL, TimeOrNow, WriteFlags,
 };
 
 use svr4_fs_core::consts::{
@@ -47,10 +47,10 @@ use svr4_fs_core::MappedImage;
 use svr4_ufs::alloc::recompute_summary_counts;
 use svr4_ufs::{
     create_empty_in_parent, detect_ufs_at_start, iter_directory_entries, link_in_parent,
-    lookup_directory_entry, mkdir_in_parent, read_inode, read_inode_bytes, read_inode_range,
-    read_symlink_target, rename_in_parent, rmdir_in_parent, set_inode_contents, set_inode_mode,
-    set_inode_owner, set_inode_times, symlink_in_parent, truncate, unlink_in_parent, Inode,
-    UfsDetector, Ufs,
+    lookup_directory_entry, mkdir_in_parent, mknod_in_parent, read_inode, read_inode_bytes,
+    read_inode_range, read_symlink_target, rename_in_parent, rmdir_in_parent, set_inode_contents,
+    set_inode_mode, set_inode_owner, set_inode_times, symlink_in_parent, truncate, unlink_in_parent,
+    Inode, UfsDetector, Ufs,
 };
 
 const TTL: Duration = Duration::from_secs(1);
@@ -118,6 +118,16 @@ fn file_type_of(mode: u32) -> FileType {
         UFS_IFSOCK => FileType::Socket,
         _ => FileType::RegularFile,
     }
+}
+
+/// Decode a Linux `dev_t` into (major, minor) per glibc's `gnu_dev_*`. Mirrors
+/// `svr4-ufs-populate`'s `split_rdev` so device nodes created over the mount land
+/// with the same major/minor a direct populate would have produced.
+fn split_rdev(rdev: u32) -> (u32, u32) {
+    let rdev = u64::from(rdev);
+    let major = (((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff)) as u32;
+    let minor = ((rdev & 0xff) | ((rdev >> 12) & !0xff)) as u32;
+    (major, minor)
 }
 
 fn make_attr(inode: &Inode, ufs_ino: i64, size: u64, blksize: u32) -> FileAttr {
@@ -286,6 +296,43 @@ impl Filesystem for UfsFs {
         }
     }
 
+    /// Permission check. SVR4 UFS here is a build/populate mount with no ACL
+    /// enforcement of its own, so we only confirm the inode exists and let the
+    /// caller proceed. Implementing this stops the kernel/rsync from logging the
+    /// op as unsupported.
+    fn access(&self, _req: &Request, ino: INodeNo, _mask: AccessFlags, reply: ReplyEmpty) {
+        let st = self.state.lock().unwrap();
+        match read_inode(st.img.as_slice(), &st.ufs, fuse_to_ufs(ino.0 as i64)) {
+            Some(_) => reply.ok(),
+            None => reply.error(Errno::ENOENT),
+        }
+    }
+
+    /// Extended attributes are not stored, so every attribute is absent. Reply
+    /// `ENODATA` (the "no such attribute" answer) rather than the default
+    /// `ENOSYS`: ENOSYS makes the kernel disable xattrs mount-wide, but rsync's
+    /// `security.capability` probe expects a clean per-name miss, and ENODATA
+    /// keeps the log quiet without that side effect.
+    fn getxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _size: u32,
+        reply: ReplyXattr,
+    ) {
+        reply.error(Errno::ENODATA);
+    }
+
+    /// No xattrs are stored, so the name list is empty (size 0).
+    fn listxattr(&self, _req: &Request, _ino: INodeNo, size: u32, reply: ReplyXattr) {
+        if size == 0 {
+            reply.size(0);
+        } else {
+            reply.data(&[]);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn setattr(
         &self,
@@ -388,6 +435,58 @@ impl Filesystem for UfsFs {
             &ufs,
             pino,
             name,
+            eff_mode,
+            req.uid(),
+            req.gid(),
+            now_secs(),
+        ) {
+            Ok(new) => match st.attr_for(new) {
+                Some(attr) => reply.entry(&TTL, &attr, Generation(0)),
+                None => reply.error(Errno::EIO),
+            },
+            Err(e) => reply.error(errno_from(&e)),
+        }
+    }
+
+    fn mknod(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        let name = name_str!(name, reply);
+        let mut st = self.state.lock().unwrap();
+        if st.read_only {
+            reply.error(Errno::EROFS);
+            return;
+        }
+        // Only char/block device nodes are supported (the UFS write path's
+        // `mknod_in_parent` rejects anything else); FIFOs and sockets in a
+        // populated tree are not needed for the system image.
+        let kind = match mode & UFS_IFMT {
+            UFS_IFCHR => UFS_IFCHR,
+            UFS_IFBLK => UFS_IFBLK,
+            _ => {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+        };
+        let (major, minor) = split_rdev(rdev);
+        let pino = fuse_to_ufs(parent.0 as i64);
+        let ufs = st.ufs.clone();
+        let eff_mode = mode & !umask & 0o7777;
+        match mknod_in_parent(
+            st.img.as_mut_slice(),
+            &ufs,
+            pino,
+            name,
+            kind,
+            major,
+            minor,
             eff_mode,
             req.uid(),
             req.gid(),
