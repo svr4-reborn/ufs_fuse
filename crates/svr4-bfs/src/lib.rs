@@ -23,6 +23,9 @@ pub use detector::BfsDetector;
 pub const BFS_MAGIC: u32 = 0x1BAD_FACE;
 pub const BFS_ROOT_INODE: u16 = 2;
 pub const BFS_SUPER_SIZE: usize = 512;
+/// Byte offset of the four compaction sanity words within the superblock
+/// (`BFS_SANITYWSTART = BFS_SUPEROFF + sizeof(long) * 3`).
+const BFS_SANITYW_OFFSET: usize = 12;
 pub const BFS_DIRENT_SIZE: usize = 64;
 pub const BFS_VATTR_SIZE: usize = 48;
 pub const BFS_LDIR_SIZE: usize = 16;
@@ -183,6 +186,14 @@ pub fn format(
     put_u32(image, 0, BFS_MAGIC);
     put_u32(image, 4, data_start as u32);
     put_u32(image, 8, (size_bytes - 1) as u32);
+    // Compaction sanity words (`bdcp_*`/`bdcpb_*`, the four daddr_t at
+    // BFS_SANITYWSTART = offset 12). A filesystem that is *not* mid-compaction
+    // has all four set to -1; the kernel mount (bfs_vfsops.c) refuses to mount —
+    // "must be checked first" — unless the backup pair (offsets 20, 24) reads -1.
+    // A freshly formatted image must therefore present the clean state.
+    for off in [BFS_SANITYW_OFFSET, BFS_SANITYW_OFFSET + 4, BFS_SANITYW_OFFSET + 8, BFS_SANITYW_OFFSET + 12] {
+        put_u32(image, off, 0xFFFF_FFFF);
+    }
 
     // Root inode (slot 0).
     let root_start_block = (data_start / SECTOR_SIZE) as u32;
@@ -360,5 +371,21 @@ mod tests {
     fn detect_rejects_non_bfs() {
         let image = vec![0u8; 8192];
         assert!(detect_at_start(&image, 0).is_none());
+    }
+
+    #[test]
+    fn format_sets_clean_compaction_sanity_words() {
+        // The kernel mount (bfs_vfsops.c) refuses to mount a BFS whose backup
+        // compaction words are not -1. A freshly formatted image must present
+        // all four sanity words (offsets 12/16/20/24) as -1.
+        let size = 64 * 1024;
+        let fs_start = 4096u64;
+        let mut image = vec![0u8; size + fs_start as usize];
+        let files: Vec<(&str, &[u8])> = vec![("unix", b"k"), ("boot", b"BL")];
+        format(&mut image, fs_start, size, &files, None, 0).unwrap();
+        let base = fs_start as usize;
+        for off in [12usize, 16, 20, 24] {
+            assert_eq!(u32(&image, base + off), 0xFFFF_FFFF, "sanity word at offset {off}");
+        }
     }
 }
