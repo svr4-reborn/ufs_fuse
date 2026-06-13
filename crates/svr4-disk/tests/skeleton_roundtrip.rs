@@ -3,7 +3,8 @@
 //! so these run anywhere.
 
 use svr4_disk::create::{
-    create_raw_image_skeleton, RawDiskGeometry, DISK_ADDRESSING_CHS, DISK_ADDRESSING_LBA28,
+    build_geometry, build_slice_layout, create_raw_image_skeleton, RawDiskGeometry,
+    SliceLayoutOptions, DISK_ADDRESSING_CHS, DISK_ADDRESSING_LBA28,
 };
 use svr4_disk::inspect::inspect_disk_metadata;
 use svr4_disk::structures::{VtocPartition, UNIXWARE_PARTITION_TYPE, VALID_PD, VTOC_SANE};
@@ -52,6 +53,75 @@ fn build_sample(path: &std::path::Path) {
         DISK_ADDRESSING_CHS,
     )
     .expect("skeleton creation succeeds");
+}
+
+#[test]
+fn build_geometry_derives_cylinders_from_size() {
+    // Mirrors tasks/make_image.py:_build_geometry. 324 MiB at 16/63 rounds up to
+    // 659 cylinders (664272 sectors).
+    let geom = build_geometry(324, 16, 63, DISK_ADDRESSING_CHS).expect("324 MiB chs");
+    assert_eq!(
+        geom,
+        RawDiskGeometry {
+            cylinders: 659,
+            heads: 16,
+            sectors_per_track: 63,
+        }
+    );
+    assert_eq!(geom.total_sectors(), 664272);
+
+    // The 1024-cylinder cap is enforced in CHS mode but not in LBA28 mode.
+    let err = build_geometry(2000, 16, 63, DISK_ADDRESSING_CHS).unwrap_err();
+    assert!(err.contains("exceeds the CHS limit of 1024"), "{err}");
+    let big = build_geometry(2000, 16, 63, DISK_ADDRESSING_LBA28).expect("2000 MiB lba28");
+    assert_eq!(big.cylinders, 4064);
+}
+
+#[test]
+fn slice_layout_matches_make_image_defaults() {
+    // Reference values come from tasks/make_image.py:_build_slice_layout for a
+    // 324 MiB / 16 / 63 disk with the default knobs.
+    let geom = build_geometry(324, 16, 63, DISK_ADDRESSING_CHS).unwrap();
+    let layout = build_slice_layout(
+        &geom,
+        &SliceLayoutOptions {
+            stand_start_sector: 64,
+            stand_size_mb: 16,
+            swap_size_mb: 64,
+            root_align_sectors: 2048,
+        },
+    )
+    .expect("layout fits");
+    assert_eq!(layout.unix_partition_start, 1);
+    assert_eq!(layout.unix_partition_size, 664271);
+    // (index, tag, flag, start, size)
+    let expected = [
+        (0u32, 0x05u16, 0x201u16, 1i64, 664271i64),
+        (1, 0x02, 0x200, 168336, 495936),
+        (2, 0x03, 0x201, 35280, 132048),
+        (10, 0x09, 0x200, 1008, 33264),
+    ];
+    assert_eq!(layout.slices.len(), expected.len());
+    for (slice, (index, tag, flag, start, size)) in layout.slices.iter().zip(expected) {
+        assert_eq!(
+            (slice.index, slice.tag, slice.flag, slice.start_sector, slice.sector_count),
+            (index, tag, flag, start, size)
+        );
+    }
+
+    // A disk too small to fit stand + swap + a root slice is rejected.
+    let tiny = build_geometry(64, 16, 63, DISK_ADDRESSING_CHS).unwrap();
+    let err = build_slice_layout(
+        &tiny,
+        &SliceLayoutOptions {
+            stand_start_sector: 64,
+            stand_size_mb: 16,
+            swap_size_mb: 64,
+            root_align_sectors: 2048,
+        },
+    )
+    .unwrap_err();
+    assert!(err.contains("root slice"), "{err}");
 }
 
 #[test]

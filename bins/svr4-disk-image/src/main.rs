@@ -10,7 +10,8 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand};
 use svr4_bfs::BfsDetector;
 use svr4_disk::create::{
-    create_raw_image_skeleton, RawDiskGeometry, DISK_ADDRESSING_CHS, DISK_ADDRESSING_LBA28,
+    build_geometry, build_slice_layout, create_raw_image_skeleton, RawDiskGeometry,
+    SliceLayoutOptions, DISK_ADDRESSING_CHS, DISK_ADDRESSING_LBA28,
 };
 use svr4_disk::inspect::{
     get_vtoc_partition_by_selector, inspect_disk_image, resolve_guest_visible_sector, DetectedFs,
@@ -18,7 +19,7 @@ use svr4_disk::inspect::{
 };
 use svr4_disk::report::format_report;
 use svr4_disk::structures::{VtocPartition, SECTOR_SIZE};
-use svr4_disk::svr4::PARTITION_TAG_NAMES;
+use svr4_disk::svr4::{partition_tag_name, PARTITION_TAG_NAMES};
 use svr4_fs_core::MappedImage;
 use svr4_ufs::{format as format_ufs_slice, FormatOptions, UfsDetector};
 
@@ -51,6 +52,9 @@ enum Command {
     },
     /// Create a raw image with MBR, pdinfo, and VTOC metadata.
     CreateSkeleton(CreateSkeletonArgs),
+    /// Create a raw image with the standard SVR4 slice layout (stand/swap/root)
+    /// sized and placed automatically. A higher-level `create-skeleton`.
+    CreateLayout(CreateLayoutArgs),
     /// Resolve a slice-relative sector through the guest-visible disk path and
     /// print a small fingerprint.
     TraceSector {
@@ -111,12 +115,19 @@ struct CreateSkeletonArgs {
     /// Output raw image path.
     #[arg(long)]
     output: PathBuf,
-    #[arg(long)]
-    cylinders: u32,
-    #[arg(long)]
+    /// Total disk size in mebibytes. Derives the cylinder count from
+    /// --heads/--sectors; the 1024-cylinder CHS cap applies only with
+    /// --disk-addressing chs. Mutually exclusive with --cylinders.
+    #[arg(long, conflicts_with = "cylinders")]
+    size: Option<u64>,
+    /// Explicit cylinder count. Required unless --size is given.
+    #[arg(long, required_unless_present = "size")]
+    cylinders: Option<u32>,
+    /// Disk geometry heads value.
+    #[arg(long, default_value_t = 16)]
     heads: u32,
     /// Sectors per track.
-    #[arg(long)]
+    #[arg(long, default_value_t = 63)]
     sectors: u32,
     #[arg(long = "unix-partition-start", default_value_t = 1)]
     unix_partition_start: u32,
@@ -134,6 +145,48 @@ struct CreateSkeletonArgs {
     /// stand, boot, backup, alts.
     #[arg(long = "slice")]
     slices: Vec<String>,
+}
+
+#[derive(Args)]
+struct CreateLayoutArgs {
+    /// Output raw image path.
+    #[arg(long)]
+    output: PathBuf,
+    /// Total disk size in mebibytes. Derives the cylinder count from
+    /// --heads/--sectors. Mutually exclusive with --cylinders.
+    #[arg(long, conflicts_with = "cylinders")]
+    size: Option<u64>,
+    /// Explicit cylinder count. Required unless --size is given.
+    #[arg(long, required_unless_present = "size")]
+    cylinders: Option<u32>,
+    /// Disk geometry heads value.
+    #[arg(long, default_value_t = 16)]
+    heads: u32,
+    /// Sectors per track.
+    #[arg(long, default_value_t = 63)]
+    sectors: u32,
+    /// Disk addressing mode for validation and MBR CHS fields. In lba28 mode the
+    /// 1024-cylinder CHS cap is lifted, allowing larger disks.
+    #[arg(long = "disk-addressing", default_value = DISK_ADDRESSING_CHS,
+          value_parser = [DISK_ADDRESSING_CHS, DISK_ADDRESSING_LBA28])]
+    disk_addressing: String,
+    /// VTOC volume label (max 8 chars).
+    #[arg(long, default_value = "SVR4")]
+    volume: String,
+    /// Absolute disk sector where the stand (/stand BFS) slice starts; rounded up
+    /// to a cylinder boundary.
+    #[arg(long = "stand-start-sector", default_value_t = 64)]
+    stand_start_sector: u64,
+    /// Size of the BFS /stand slice in mebibytes.
+    #[arg(long = "stand-size", default_value_t = 16)]
+    stand_size: u64,
+    /// Size of the raw swap slice in mebibytes.
+    #[arg(long = "swap-size", default_value_t = 64)]
+    swap_size: u64,
+    /// Alignment (in sectors) for the swap and root slice starts, applied before
+    /// cylinder alignment.
+    #[arg(long = "root-align", default_value_t = 2048)]
+    root_align: u64,
 }
 
 /// Parse an integer the way Python's `int(value, 0)` does: `0x`/`0o`/`0b`
@@ -209,6 +262,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         Command::CreateSkeleton(args) => create_skeleton(args),
+        Command::CreateLayout(args) => create_layout(args),
         Command::FormatBfs(args) => format_bfs(args),
         Command::FormatUfs(args) => format_ufs(args),
         Command::TraceSector {
@@ -249,12 +303,33 @@ fn run() -> Result<(), String> {
     }
 }
 
+/// Resolve a geometry from either an explicit cylinder count or a target size in
+/// mebibytes. clap guarantees exactly one of `size`/`cylinders` is present.
+fn resolve_geometry(
+    size: Option<u64>,
+    cylinders: Option<u32>,
+    heads: u32,
+    sectors: u32,
+    disk_addressing: &str,
+) -> Result<RawDiskGeometry, String> {
+    match size {
+        Some(size_mb) => build_geometry(size_mb, heads, sectors, disk_addressing),
+        None => Ok(RawDiskGeometry {
+            cylinders: cylinders.expect("--cylinders is required without --size"),
+            heads,
+            sectors_per_track: sectors,
+        }),
+    }
+}
+
 fn create_skeleton(args: CreateSkeletonArgs) -> Result<(), String> {
-    let geometry = RawDiskGeometry {
-        cylinders: args.cylinders,
-        heads: args.heads,
-        sectors_per_track: args.sectors,
-    };
+    let geometry = resolve_geometry(
+        args.size,
+        args.cylinders,
+        args.heads,
+        args.sectors,
+        &args.disk_addressing,
+    )?;
     let unix_partition_size = args.unix_partition_size.unwrap_or_else(|| {
         (geometry.total_sectors() as u32).saturating_sub(args.unix_partition_start)
     });
@@ -275,6 +350,54 @@ fn create_skeleton(args: CreateSkeletonArgs) -> Result<(), String> {
         &args.disk_addressing,
     )?;
     println!("Created raw disk skeleton at {}", output.display());
+    Ok(())
+}
+
+fn create_layout(args: CreateLayoutArgs) -> Result<(), String> {
+    let geometry = resolve_geometry(
+        args.size,
+        args.cylinders,
+        args.heads,
+        args.sectors,
+        &args.disk_addressing,
+    )?;
+    let layout = build_slice_layout(
+        &geometry,
+        &SliceLayoutOptions {
+            stand_start_sector: args.stand_start_sector,
+            stand_size_mb: args.stand_size,
+            swap_size_mb: args.swap_size,
+            root_align_sectors: args.root_align,
+        },
+    )?;
+    let output = absolutize(&args.output);
+    create_raw_image_skeleton(
+        &output,
+        &geometry,
+        layout.unix_partition_start,
+        layout.unix_partition_size,
+        &args.volume,
+        &layout.slices,
+        None,
+        &args.disk_addressing,
+    )?;
+    println!(
+        "Created raw disk image with standard layout at {} ({}/{}/{} geometry)",
+        output.display(),
+        geometry.cylinders,
+        geometry.heads,
+        geometry.sectors_per_track
+    );
+    for slice in &layout.slices {
+        let mib = slice.sector_count * SECTOR_SIZE as i64 / (1024 * 1024);
+        println!(
+            "  slice {:>2}: tag={:<6} start={:<10} size={:<10} ({mib} MiB)",
+            slice.index,
+            partition_tag_name(slice.tag),
+            slice.start_sector,
+            slice.sector_count,
+        );
+    }
     Ok(())
 }
 

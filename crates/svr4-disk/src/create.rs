@@ -14,7 +14,7 @@ use crate::structures::{
     PartitionEntry, VtocPartition, HDPDLOC, SECTOR_SIZE, UNIXWARE_PARTITION_TYPE, VALID_PD,
     VTOC_SANE,
 };
-use crate::svr4::{ALT_SANITY, ALT_VERSION};
+use crate::svr4::{ALT_SANITY, ALT_VERSION, V_BACKUP};
 
 pub const MAX_ALTENTS: usize = 253;
 pub const MAX_CHS_CYLINDERS: u32 = 1024;
@@ -88,6 +88,159 @@ pub fn validate_geometry(geometry: &RawDiskGeometry, disk_addressing: &str) -> B
 
 pub fn max_chs_lba(geometry: &RawDiskGeometry) -> u64 {
     geometry.total_sectors() - 1
+}
+
+/// Round `value` up to the next multiple of `alignment`. Port of `_align_up`.
+fn align_up(value: u64, alignment: u64) -> u64 {
+    if alignment == 0 {
+        return value;
+    }
+    value.div_ceil(alignment) * alignment
+}
+
+/// Derive a CHS-style geometry from a desired image size in mebibytes, picking
+/// the cylinder count for the given `heads`/`sectors_per_track`. Port of
+/// `tasks/make_image.py:_build_geometry`. The cylinder count is whatever the
+/// size requires: the 1024-cylinder CHS cap is enforced only in CHS mode, so an
+/// LBA28 image may grow past it (the same relaxation `validate_geometry` makes).
+pub fn build_geometry(
+    size_mb: u64,
+    heads: u32,
+    sectors_per_track: u32,
+    disk_addressing: &str,
+) -> BuildResult<RawDiskGeometry> {
+    if heads == 0 || sectors_per_track == 0 {
+        return Err("error: disk geometry values must all be positive".into());
+    }
+    let sectors_per_cylinder = heads as u64 * sectors_per_track as u64;
+    let total_sectors = align_up(size_mb * 1024 * 1024 / SECTOR_SIZE as u64, sectors_per_cylinder);
+    let cylinders = total_sectors / sectors_per_cylinder;
+    if heads > MAX_KERNEL_CHS_HEADS {
+        return Err(format!(
+            "error: CHS geometry exceeds current kernel head limit ({heads} > {MAX_KERNEL_CHS_HEADS})"
+        ));
+    }
+    if sectors_per_track > MAX_CHS_SECTORS_PER_TRACK {
+        return Err(format!(
+            "error: CHS geometry exceeds sector-per-track limit ({sectors_per_track} > {MAX_CHS_SECTORS_PER_TRACK})"
+        ));
+    }
+    if disk_addressing == DISK_ADDRESSING_CHS && cylinders > MAX_CHS_CYLINDERS as u64 {
+        return Err(format!(
+            "error: requested image size needs {cylinders} cylinders, which exceeds the CHS limit of {MAX_CHS_CYLINDERS}; reduce --size or change geometry"
+        ));
+    }
+    Ok(RawDiskGeometry {
+        cylinders: cylinders as u32,
+        heads,
+        sectors_per_track,
+    })
+}
+
+/// VTOC tags for the standard SVR4 slice layout (mirrors make_image.py). The
+/// backup tag is `V_BACKUP` from `crate::svr4`.
+const LAYOUT_TAG_ROOT: u16 = 0x02;
+const LAYOUT_TAG_SWAP: u16 = 0x03;
+const LAYOUT_TAG_STAND: u16 = 0x09;
+/// VTOC flags: `V_VALID` for mountable filesystem slices, `V_VALID | V_UNMNT`
+/// for the un-mountable backup and raw-swap slices.
+const LAYOUT_FLAG_FS: u16 = 0x200;
+const LAYOUT_FLAG_RAW: u16 = 0x201;
+
+/// Knobs for [`build_slice_layout`]. The CLI's defaults match make_image.py:
+/// `stand_start_sector = 64`, `stand_size_mb = 16`, `swap_size_mb = 64`,
+/// `root_align_sectors = 2048`.
+#[derive(Clone, Copy, Debug)]
+pub struct SliceLayoutOptions {
+    pub stand_start_sector: u64,
+    pub stand_size_mb: u64,
+    pub swap_size_mb: u64,
+    pub root_align_sectors: u64,
+}
+
+/// A resolved disk layout: the UNIX-partition bounds plus the VTOC slice table.
+#[derive(Clone, Debug)]
+pub struct DiskLayout {
+    pub unix_partition_start: u32,
+    pub unix_partition_size: u32,
+    pub slices: Vec<VtocPartition>,
+}
+
+/// Compute the standard SVR4 slice layout (backup/root/swap/stand) for a disk of
+/// the given geometry. Port of `tasks/make_image.py:_build_slice_layout`: the
+/// stand slice sits first (cylinder-aligned), then swap and root each begin on a
+/// boundary aligned to both `root_align_sectors` *and* a whole cylinder, and root
+/// claims the rest of the disk rounded down to a whole cylinder. Slice 0 (backup)
+/// spans the entire UNIX partition. Sizes are in mebibytes; everything else is in
+/// 512-byte sectors.
+pub fn build_slice_layout(
+    geometry: &RawDiskGeometry,
+    opts: &SliceLayoutOptions,
+) -> BuildResult<DiskLayout> {
+    let spc = geometry.heads as u64 * geometry.sectors_per_track as u64;
+    let total = geometry.total_sectors();
+    let unix_partition_start: u64 = 1;
+    let unix_partition_size = total - unix_partition_start;
+
+    let stand_start = align_up(opts.stand_start_sector, spc);
+    let stand_count = align_up(opts.stand_size_mb * 1024 * 1024 / SECTOR_SIZE as u64, spc);
+    let swap_count = align_up(opts.swap_size_mb * 1024 * 1024 / SECTOR_SIZE as u64, spc);
+    if stand_count == 0 {
+        return Err("error: stand slice size must be positive".into());
+    }
+    if swap_count == 0 {
+        return Err("error: swap slice size must be positive".into());
+    }
+    let stand_end = stand_start + stand_count;
+    let swap_start = align_up(align_up(stand_end, opts.root_align_sectors), spc);
+    let swap_end = swap_start + swap_count;
+    let root_start = align_up(align_up(swap_end, opts.root_align_sectors), spc);
+    if stand_start < unix_partition_start {
+        return Err("error: stand slice starts before the UNIX partition".into());
+    }
+    if root_start >= total {
+        return Err("error: root slice would start beyond the end of the disk image".into());
+    }
+    let root_count = ((total - root_start) / spc) * spc;
+    if root_count == 0 {
+        return Err("error: root slice would be empty".into());
+    }
+
+    let slices = vec![
+        VtocPartition {
+            index: 0,
+            tag: V_BACKUP,
+            flag: LAYOUT_FLAG_RAW,
+            start_sector: unix_partition_start as i64,
+            sector_count: unix_partition_size as i64,
+        },
+        VtocPartition {
+            index: 1,
+            tag: LAYOUT_TAG_ROOT,
+            flag: LAYOUT_FLAG_FS,
+            start_sector: root_start as i64,
+            sector_count: root_count as i64,
+        },
+        VtocPartition {
+            index: 2,
+            tag: LAYOUT_TAG_SWAP,
+            flag: LAYOUT_FLAG_RAW,
+            start_sector: swap_start as i64,
+            sector_count: swap_count as i64,
+        },
+        VtocPartition {
+            index: 10,
+            tag: LAYOUT_TAG_STAND,
+            flag: LAYOUT_FLAG_FS,
+            start_sector: stand_start as i64,
+            sector_count: stand_count as i64,
+        },
+    ];
+    Ok(DiskLayout {
+        unix_partition_start: unix_partition_start as u32,
+        unix_partition_size: unix_partition_size as u32,
+        slices,
+    })
 }
 
 pub fn validate_unix_partition(
